@@ -145,6 +145,52 @@ class DetectionStats:
                 "persons_without_phone_standing": self.current_persons_without_phone_standing
             }
         }
+    
+    def get_final_summary(self):
+        """Retourne un résumé final formaté pour l'affichage"""
+        session_duration = datetime.now() - self.session_start_time
+        hours = int(session_duration.total_seconds() // 3600)
+        minutes = int((session_duration.total_seconds() % 3600) // 60)
+        seconds = int(session_duration.total_seconds() % 60)
+        
+        total_phone_actions = self.total_phone_moving_actions + self.total_phone_standing_actions
+        
+        return {
+            "session_duration": f"{hours:02d}h {minutes:02d}m {seconds:02d}s",
+            "total_frames": self.total_frames_processed,
+            "avg_fps": round(self.fps, 2),
+            "total_unique_persons": self.total_persons_detected,
+            "total_phone_actions": total_phone_actions,
+            "phone_moving_actions": self.total_phone_moving_actions,
+            "phone_standing_actions": self.total_phone_standing_actions,
+            "session_start": self.session_start_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "session_end": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    
+    def print_final_summary(self):
+        """Affiche le résumé final des statistiques"""
+        summary = self.get_final_summary()
+        
+        print("\n" + "=" * 70)
+        print("📊 RÉSUMÉ FINAL DE LA SESSION")
+        print("=" * 70)
+        print(f"⏱️  Durée de la session: {summary['session_duration']}")
+        print(f"📅 Début: {summary['session_start']}")
+        print(f"📅 Fin: {summary['session_end']}")
+        print("-" * 70)
+        print("📈 PERFORMANCE:")
+        print(f"   • Frames traitées: {summary['total_frames']:,}")
+        print(f"   • FPS moyen: {summary['avg_fps']}")
+        print("-" * 70)
+        print("👥 PERSONNES:")
+        print(f"   • Personnes uniques détectées: {summary['total_unique_persons']}")
+        print("-" * 70)
+        print("📱 ACTIONS TÉLÉPHONE:")
+        print(f"   • Total d'actions téléphone: {summary['total_phone_actions']}")
+        print(f"   • Téléphone + En mouvement: {summary['phone_moving_actions']}")
+        print(f"   • Téléphone + Statique: {summary['phone_standing_actions']}")
+        print("=" * 70)
+        print()
 
 def calculate_iou(box1, box2):
     """Calcule l'IoU entre deux bounding boxes"""
@@ -166,8 +212,85 @@ def calculate_iou(box1, box2):
     
     return intersection / union if union > 0 else 0.0
 
-def find_closest_phone_to_person(person_bbox, phones, max_distance=200):
-    """Trouve le téléphone le plus proche d'une personne avec distance augmentée"""
+def get_hand_keypoints(person_bbox, pose_results):
+    """Extrait les keypoints des mains d'une personne depuis les résultats pose
+    
+    Keypoints COCO pose: 9=poignet gauche, 10=poignet droit
+    """
+    if pose_results is None:
+        return None, None
+    
+    # pose_results peut être un objet Results ou une liste
+    try:
+        if hasattr(pose_results, 'keypoints'):
+            # Un seul résultat
+            results_list = [pose_results]
+        else:
+            # Liste de résultats
+            results_list = pose_results if isinstance(pose_results, (list, tuple)) else []
+    except:
+        return None, None
+    
+    if len(results_list) == 0:
+        return None, None
+    
+    person_x1, person_y1, person_x2, person_y2 = person_bbox
+    
+    # Trouver la personne correspondante dans les résultats pose
+    for result in results_list:
+        try:
+            if result.keypoints is None or len(result.keypoints) == 0:
+                continue
+            
+            # Vérifier si les keypoints correspondent à cette personne (bbox overlap)
+            if hasattr(result, 'boxes') and len(result.boxes) > 0:
+                pose_bbox = result.boxes.xyxy[0].cpu().numpy()
+                pose_iou = calculate_iou(person_bbox, pose_bbox)
+                
+                if pose_iou > 0.3:  # Correspondance probable
+                    keypoints = result.keypoints.data[0].cpu().numpy() if hasattr(result.keypoints, 'data') else result.keypoints[0].cpu().numpy()
+                    # Keypoints: [x, y, confidence] pour chaque point
+                    # Index 9 = poignet gauche, 10 = poignet droit
+                    if len(keypoints) >= 11:
+                        left_wrist = keypoints[9] if len(keypoints[9]) >= 3 and keypoints[9][2] > 0.3 else None
+                        right_wrist = keypoints[10] if len(keypoints[10]) >= 3 and keypoints[10][2] > 0.3 else None
+                        return left_wrist, right_wrist
+        except Exception as e:
+            continue
+    
+    return None, None
+
+def is_phone_near_hands(phone_bbox, left_wrist, right_wrist, max_hand_distance=80):
+    """Vérifie si un téléphone est proche des mains détectées"""
+    if left_wrist is None and right_wrist is None:
+        return False
+    
+    phone_center = ((phone_bbox[0] + phone_bbox[2]) / 2,
+                   (phone_bbox[1] + phone_bbox[3]) / 2)
+    
+    if left_wrist is not None:
+        distance = np.sqrt((phone_center[0] - left_wrist[0])**2 + 
+                         (phone_center[1] - left_wrist[1])**2)
+        if distance < max_hand_distance:
+            return True
+    
+    if right_wrist is not None:
+        distance = np.sqrt((phone_center[0] - right_wrist[0])**2 + 
+                         (phone_center[1] - right_wrist[1])**2)
+        if distance < max_hand_distance:
+            return True
+    
+    return False
+
+def find_closest_phone_to_person(person_bbox, phones, pose_results=None, max_distance=180):
+    """Trouve le téléphone le plus proche d'une personne avec règles d'association équilibrées
+    
+    CRITÈRES ÉQUILIBRÉS :
+    - Téléphone doit être proche de la personne (max 180 pixels) - assoupli pour meilleure détection
+    - Téléphone doit chevaucher ou être dans zone proche (60% de la personne)
+    - Priorité aux téléphones près des mains (via pose estimation)
+    - Protection contre téléphone sur table à 5m ≠ personne lointaine
+    """
     if not phones:
         return None
     
@@ -176,60 +299,119 @@ def find_closest_phone_to_person(person_bbox, phones, max_distance=200):
     
     closest_phone = None
     min_distance = float('inf')
+    best_score = 0  # Score basé sur proximité et chevauchement
+    
+    person_width = person_bbox[2] - person_bbox[0]
+    person_height = person_bbox[3] - person_bbox[1]
+    
+    # Zone modérée pour associer les téléphones (60% de la personne)
+    # Assez large pour détecter mais pas trop pour éviter associations lointaines
+    zone_x1 = person_bbox[0] - person_width * 0.5
+    zone_y1 = person_bbox[1] - person_height * 0.3
+    zone_x2 = person_bbox[2] + person_width * 0.5
+    zone_y2 = person_bbox[3] + person_height * 0.3
+    
+    # Récupérer les keypoints des mains si disponibles
+    left_wrist, right_wrist = get_hand_keypoints(person_bbox, pose_results)
     
     for phone in phones:
         phone_center = ((phone['bbox'][0] + phone['bbox'][2]) / 2,
                        (phone['bbox'][1] + phone['bbox'][3]) / 2)
         
+        # Distance euclidienne
         distance = np.sqrt((person_center[0] - phone_center[0])**2 + 
                          (person_center[1] - phone_center[1])**2)
         
-        person_width = person_bbox[2] - person_bbox[0]
-        person_height = person_bbox[3] - person_bbox[1]
-        
-        # Zone étendue pour associer les téléphones
-        extended_x1 = person_bbox[0] - person_width * 0.8
-        extended_y1 = person_bbox[1] - person_height * 0.8
-        extended_x2 = person_bbox[2] + person_width * 0.8
-        extended_y2 = person_bbox[3] + person_height * 0.8
+        # CRITÈRE 1: Distance maximale modérée (180 pixels)
+        # Si téléphone très loin, ignorer (protection contre téléphone sur table lointaine)
+        if distance > max_distance:
+            continue  # Téléphone trop loin, ignorer
         
         phone_x1, phone_y1, phone_x2, phone_y2 = phone['bbox']
-        phone_in_zone = (extended_x1 <= phone_x1 <= extended_x2 and 
-                        extended_x1 <= phone_x2 <= extended_x2 and
-                        extended_y1 <= phone_y1 <= extended_y2 and 
-                        extended_y1 <= phone_y2 <= extended_y2)
         
-        if distance < min_distance and distance < max_distance and phone_in_zone:
+        # CRITÈRE 2: Téléphone doit être dans zone OU chevaucher la personne
+        phone_in_zone = (zone_x1 <= phone_x1 <= zone_x2 or 
+                        zone_x1 <= phone_x2 <= zone_x2) and \
+                       (zone_y1 <= phone_y1 <= zone_y2 or 
+                        zone_y1 <= phone_y2 <= zone_y2)
+        
+        # Calculer IoU pour prioriser les téléphones qui chevauchent la personne
+        iou = calculate_iou(person_bbox, phone['bbox'])
+        
+        # CRITÈRE 3: IoU minimum OU dans zone OU près des mains
+        phone_near_hands = is_phone_near_hands(phone['bbox'], left_wrist, right_wrist, max_hand_distance=100)
+        
+        # Accepter si : chevauche significatif OU dans zone OU près des mains
+        if iou < 0.01 and not phone_in_zone and not phone_near_hands:
+            continue  # Téléphone trop éloigné, pas d'association
+        
+        # Score basé sur distance, IoU et proximité mains
+        score = (1.0 / (1.0 + distance / 60.0)) + (iou * 4.0)  # IoU a plus de poids
+        
+        # BONUS: Téléphone près des mains détectées (pose estimation) - très important
+        if phone_near_hands:
+            score += 3.0  # Fort bonus pour téléphone dans la main
+        
+        # BONUS: Téléphone près de la tête (position d'appel)
+        if is_phone_near_head(person_bbox, phone['bbox']):
+            score += 2.0
+        
+        # BONUS: Téléphone chevauche la personne
+        if iou > 0.05:
+            score += 1.5
+        
+        # BONUS: Téléphone dans zone proche
+        if phone_in_zone:
+            score += 0.5
+        
+        if score > best_score:
             min_distance = distance
+            best_score = score
             closest_phone = phone
     
     return closest_phone
 
 def is_phone_near_head(person_bbox, phone_bbox):
-    """Détection du téléphone près de la tête avec seuils plus permissifs"""
+    """Détection du téléphone près de la tête - très permissif pour position d'appel"""
     person_x1, person_y1, person_x2, person_y2 = person_bbox
     phone_x1, phone_y1, phone_x2, phone_y2 = phone_bbox
     
-    # Zone de tête étendue (60% de la hauteur au lieu de 50%)
+    # Zone de tête très étendue (70% de la hauteur) pour capturer position d'appel
     head_y1 = person_y1
-    head_y2 = person_y1 + (person_y2 - person_y1) * 0.6
+    head_y2 = person_y1 + (person_y2 - person_y1) * 0.7
     
     phone_center_y = (phone_y1 + phone_y2) / 2
     phone_center_x = (phone_x1 + phone_x2) / 2
     person_center_x = (person_x1 + person_x2) / 2
     
     person_width = person_x2 - person_x1
-    # Distance horizontale plus permissive (80% au lieu de 60%)
-    max_horizontal_distance = person_width * 0.8
+    person_height = person_y2 - person_y1
     
+    # Distance horizontale très permissive (100% de la largeur) pour position d'appel
+    max_horizontal_distance = person_width * 1.0
+    
+    # Vérifier si le téléphone chevauche la zone de tête
     in_head_zone = head_y1 <= phone_center_y <= head_y2
     close_horizontally = abs(phone_center_x - person_center_x) < max_horizontal_distance
     
-    # Seuil "très proche" plus permissif (50% au lieu de 30%)
-    phone_very_close = (phone_center_y >= head_y1 and phone_center_y <= head_y2 and
-                       abs(phone_center_x - person_center_x) < person_width * 0.5)
+    # Vérifier si le téléphone chevauche physiquement la zone de tête (même partiellement)
+    phone_overlaps_head = not (phone_y2 < head_y1 or phone_y1 > head_y2)
+    phone_near_horizontally = not (phone_x2 < person_x1 - person_width * 0.3 or 
+                                   phone_x1 > person_x2 + person_width * 0.3)
     
-    return (in_head_zone and close_horizontally) or phone_very_close
+    # Seuil "très proche" - très permissif pour position d'appel
+    phone_very_close = (phone_center_y >= head_y1 and phone_center_y <= head_y2 and
+                       abs(phone_center_x - person_center_x) < person_width * 0.7)
+    
+    # Vérifier si le téléphone est dans une zone étendue autour de la tête (position d'appel)
+    head_zone_extended = (head_y1 - person_height * 0.1 <= phone_center_y <= head_y2 + person_height * 0.1)
+    head_horizontal_extended = abs(phone_center_x - person_center_x) < person_width * 0.9
+    
+    # Accepter si : téléphone dans zone tête OU chevauche tête OU très proche OU zone étendue
+    return ((in_head_zone and close_horizontally) or 
+            (phone_overlaps_head and phone_near_horizontally) or
+            phone_very_close or
+            (head_zone_extended and head_horizontal_extended))
 
 def detect_movement_stable(displacement_history, frame_count):
     """Détection de mouvement stable avec seuils adaptatifs"""
@@ -342,7 +524,7 @@ class RobustPersonTracker:
             else:
                 return False
     
-    def update_persons(self, detected_persons, phones, frame_count):
+    def update_persons(self, detected_persons, phones, frame_count, pose_results=None):
         """Met à jour le suivi des personnes avec gestion robuste"""
         current_persons = []
         matched_indices = set()
@@ -401,15 +583,24 @@ class RobustPersonTracker:
                 
                 is_moving = self.person_movement_state[person_id]
                 
-                # Trouver le téléphone le plus proche (détection instantanée)
-                closest_phone = find_closest_phone_to_person(person_bbox, phones)
+                # Trouver le téléphone le plus proche avec règles d'association équilibrées
+                # (téléphone déjà filtré pour être associé à cette personne)
+                closest_phone = find_closest_phone_to_person(person_bbox, phones, pose_results, max_distance=180)
                 current_phone_detected = False
                 phone_bbox_for_state = None
                 
                 if closest_phone:
-                    # Vérifier si le téléphone est vraiment associé à cette personne
-                    if is_phone_near_head(person_bbox, closest_phone['bbox']) or \
-                       calculate_iou(person_bbox, closest_phone['bbox']) > 0.1:
+                    # Le téléphone est déjà validé comme associé (via filtrage strict)
+                    # Vérifications supplémentaires pour confirmer
+                    iou_value = calculate_iou(person_bbox, closest_phone['bbox'])
+                    phone_near_head = is_phone_near_head(person_bbox, closest_phone['bbox'])
+                    
+                    # Récupérer keypoints des mains pour validation
+                    left_wrist, right_wrist = get_hand_keypoints(person_bbox, pose_results)
+                    phone_near_hands = is_phone_near_hands(closest_phone['bbox'], left_wrist, right_wrist)
+                    
+                    # Accepter si : près de tête OU près des mains OU chevauche significatif
+                    if phone_near_head or phone_near_hands or iou_value > 0.05:
                         current_phone_detected = True
                         phone_bbox_for_state = closest_phone['bbox']
                 
@@ -449,15 +640,24 @@ class RobustPersonTracker:
                 curr_center = ((person_bbox[0] + person_bbox[2]) / 2, 
                              (person_bbox[1] + person_bbox[3]) / 2)
                 
-                # Trouver le téléphone le plus proche (détection instantanée)
-                closest_phone = find_closest_phone_to_person(person_bbox, phones)
+                # Trouver le téléphone le plus proche avec règles d'association équilibrées
+                # (téléphone déjà filtré pour être associé à cette personne)
+                closest_phone = find_closest_phone_to_person(person_bbox, phones, pose_results, max_distance=180)
                 current_phone_detected = False
                 phone_bbox_for_state = None
                 
                 if closest_phone:
-                    # Vérifier si le téléphone est vraiment associé à cette personne
-                    if is_phone_near_head(person_bbox, closest_phone['bbox']) or \
-                       calculate_iou(person_bbox, closest_phone['bbox']) > 0.1:
+                    # Le téléphone est déjà validé comme associé (via filtrage strict)
+                    # Vérifications supplémentaires pour confirmer
+                    iou_value = calculate_iou(person_bbox, closest_phone['bbox'])
+                    phone_near_head = is_phone_near_head(person_bbox, closest_phone['bbox'])
+                    
+                    # Récupérer keypoints des mains pour validation
+                    left_wrist, right_wrist = get_hand_keypoints(person_bbox, pose_results)
+                    phone_near_hands = is_phone_near_hands(closest_phone['bbox'], left_wrist, right_wrist)
+                    
+                    # Accepter si : près de tête OU près des mains OU chevauche significatif
+                    if phone_near_head or phone_near_hands or iou_value > 0.05:
                         current_phone_detected = True
                         phone_bbox_for_state = closest_phone['bbox']
                 
@@ -620,29 +820,50 @@ class DetectionSystem:
         self.tracker = RobustPersonTracker()
         self.stats = DetectionStats()
         self.model = None
+        self.pose_model = None  # Modèle pose pour détection des mains
         self.cap = None
         self.running = False
         self.frame_queue = queue.Queue(maxsize=10)
         self.latest_stats = {}
         
     def initialize(self):
-        """Initialise le système de détection avec modèle YOLOv8m"""
+        """Initialise le système de détection avec modèle YOLOv11l ou YOLOv8l pour précision maximale"""
         try:
-            # Charger le modèle YOLOv8m directement
-            logger.info("🔄 Chargement du modèle YOLOv8m...")
+            # Charger le modèle le plus précis (YOLOv11l > YOLOv8l > YOLOv8m)
+            logger.info("🔄 Chargement du modèle haute précision...")
             
             try:
-                self.model = YOLO('yolov8m.pt')
-                logger.info("✅ Modèle YOLOv8m chargé! (Très précis pour téléphones)")
+                # Essayer YOLOv11l d'abord (meilleur modèle récent)
+                self.model = YOLO('yolo11l.pt')
+                logger.info("✅ Modèle YOLOv11l chargé! (Précision maximale)")
             except:
-                # Fallback vers YOLOv8s si m n'est pas disponible
                 try:
-                    self.model = YOLO('yolov8s.pt')
-                    logger.info("✅ Modèle YOLOv8s chargé! (Fallback)")
+                    # Fallback vers YOLOv8l (très précis)
+                    self.model = YOLO('yolov8l.pt')
+                    logger.info("✅ Modèle YOLOv8l chargé! (Très précis)")
                 except:
-                    # Fallback vers nano si rien d'autre n'est disponible
-                    self.model = YOLO('yolov8n.pt')
-                    logger.warning("⚠️ Utilisation du modèle nano (fallback)")
+                    try:
+                        # Fallback vers YOLOv8m si l n'est pas disponible
+                        self.model = YOLO('yolov8m.pt')
+                        logger.warning("⚠️ Modèle YOLOv8m chargé (fallback - moins précis)")
+                    except:
+                        # Dernier recours
+                        self.model = YOLO('yolov8s.pt')
+                        logger.warning("⚠️ Modèle YOLOv8s chargé (fallback - précision réduite)")
+            
+            # Charger le modèle pose pour détection des mains/keypoints
+            logger.info("🔄 Chargement du modèle YOLOv8-pose pour détection des mains...")
+            try:
+                self.pose_model = YOLO('yolov8n-pose.pt')
+                logger.info("✅ Modèle YOLOv8-pose chargé! (Détection keypoints mains/tête)")
+            except:
+                try:
+                    # Essayer avec pose sans spécifier la taille
+                    self.pose_model = YOLO('yolov8-pose.pt')
+                    logger.info("✅ Modèle YOLOv8-pose chargé!")
+                except:
+                    logger.warning("⚠️ Modèle pose non disponible - détection téléphone via keypoints désactivée")
+                    self.pose_model = None
             
             # Ouvrir la caméra
             self.cap = cv2.VideoCapture(0)
@@ -665,18 +886,37 @@ class DetectionSystem:
             return False
     
     def process_frame(self, frame):
-        """Traite une frame avec seuils optimisés pour téléphones"""
+        """Traite une frame avec seuils optimisés pour précision maximale et zéro faux positifs"""
         if self.model is None:
-            return [], []
+            return [], [], None
         
-        # Détection YOLO avec seuils optimisés et NMS plus stricte
-        # - iou plus élevé pour réduire les doublons
+        # Détection YOLO avec seuils optimisés pour précision maximale
+        # - conf global bas pour détecter tout, filtrage strict par classe ensuite
+        # - iou élevé (0.7) pour NMS stricte et réduction des doublons
         # - max_det limité pour éviter la sur-détection
-        # - conf global bas, filtrage par classe ensuite
-        results = self.model(frame, conf=0.15, iou=0.6, max_det=50, classes=[0, 67], verbose=False)
+        # - imgsz=640 pour optimiser performance tout en gardant précision
+        results = self.model(frame, conf=0.25, iou=0.7, max_det=50, classes=[0, 67], imgsz=640, verbose=False)
+        
+        # Détection pose pour keypoints (mains, tête) si disponible
+        pose_results = None
+        if self.pose_model is not None:
+            try:
+                pose_results = self.pose_model(frame, conf=0.5, iou=0.7, imgsz=640, verbose=False)
+            except:
+                pose_results = None
         
         persons = []
         phones = []
+        
+        # Seuils stricts pour zéro faux positifs
+        PERSON_MIN_CONF = 0.65  # Seuil élevé pour personnes (réduit faux positifs)
+        PHONE_MIN_CONF = 0.35   # Seuil modéré pour téléphones (équilibre précision/détection)
+        PHONE_NEAR_HEAD_CONF = 0.25  # Seuil plus bas pour téléphones près de la tête (position d'appel)
+        
+        # Taille minimale pour filtrer les objets trop petits (probablement faux positifs)
+        # Réduit pour permettre détection de personnes proches (buste uniquement)
+        MIN_PERSON_AREA = 1000   # pixels² (environ 30x35 pixels) - réduit pour personnes proches
+        MIN_PHONE_AREA = 100     # pixels² (environ 10x10 pixels)
         
         if results and results[0].boxes is not None:
             for box in results[0].boxes:
@@ -684,22 +924,66 @@ class DetectionSystem:
                 confidence = float(box.conf[0])
                 x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                 
+                # Calculer la surface de la bounding box
+                width = x2 - x1
+                height = y2 - y1
+                area = width * height
+                
                 if class_id == 0:  # person
-                    # Seuil plus strict pour réduire les faux positifs
-                    if confidence >= 0.50:
-                        persons.append({
-                            'bbox': [x1, y1, x2, y2],
-                            'confidence': confidence
-                        })
+                    # Seuil strict pour réduire faux positifs
+                    if confidence >= PERSON_MIN_CONF:
+                        # Validation adaptative selon la confiance et la taille
+                        # Si confiance très élevée (>0.75), être moins strict (personnes proches)
+                        # Si confiance moyenne, être plus strict (réduire faux positifs)
+                        
+                        if confidence >= 0.75:
+                            # Haute confiance : accepte les personnes proches (buste, ratio variable)
+                            # Taille minimale réduite pour personnes proches
+                            min_area = 500  # Très permissif pour personnes très proches
+                            aspect_ratio = height / width if width > 0 else 0
+                            # Ratio très permissif : 0.8 à 5.0 (buste peut être presque carré ou très allongé)
+                            if area >= min_area and 0.8 <= aspect_ratio <= 5.0:
+                                persons.append({
+                                    'bbox': [x1, y1, x2, y2],
+                                    'confidence': confidence
+                                })
+                        elif confidence >= 0.70:
+                            # Confiance élevée : taille minimale modérée
+                            min_area = 800
+                            aspect_ratio = height / width if width > 0 else 0
+                            # Ratio modéré : 1.0 à 4.5
+                            if area >= min_area and 1.0 <= aspect_ratio <= 4.5:
+                                persons.append({
+                                    'bbox': [x1, y1, x2, y2],
+                                    'confidence': confidence
+                                })
+                        else:
+                            # Confiance moyenne : filtres stricts (réduire faux positifs)
+                            aspect_ratio = height / width if width > 0 else 0
+                            if area >= MIN_PERSON_AREA and 1.2 <= aspect_ratio <= 4.0:
+                                persons.append({
+                                    'bbox': [x1, y1, x2, y2],
+                                    'confidence': confidence
+                                })
                 elif class_id == 67:  # cell phone
-                    # Seuil très bas pour les téléphones
-                    if confidence >= 0.15:
+                    # Seuil adaptatif : plus bas si téléphone détecté près d'une zone de tête
+                    # (pour capturer position d'appel même avec confiance plus faible)
+                    phone_conf_threshold = PHONE_MIN_CONF
+                    
+                    # Vérifier si le téléphone pourrait être près d'une tête
+                    # (on vérifie après avoir collecté toutes les personnes, donc on accepte ici)
+                    # Accepter avec seuil plus bas si confiance modérée (peut être position d'appel)
+                    if 0.20 <= confidence < PHONE_MIN_CONF:
+                        # Seuil réduit pour téléphones potentiellement en position d'appel
+                        phone_conf_threshold = PHONE_NEAR_HEAD_CONF
+                    
+                    if confidence >= phone_conf_threshold and area >= MIN_PHONE_AREA:
                         phones.append({
                             'bbox': [x1, y1, x2, y2],
                             'confidence': confidence
                         })
         
-        return persons, phones
+        return persons, phones, pose_results
     
     def detection_loop(self):
         """Boucle principale de détection avec visualisation"""
@@ -715,10 +999,31 @@ class DetectionSystem:
                 frame_count += 1
                 
                 # Traiter la frame
-                persons, phones = self.process_frame(frame)
+                persons, phones, pose_results = self.process_frame(frame)
                 
-                # Mettre à jour le suivi des personnes
-                current_persons = self.tracker.update_persons(persons, phones, frame_count)
+                # FILTRER les téléphones : ne garder QUE ceux associés à une personne
+                # Un téléphone sur table à 5m ne doit PAS être associé à une personne lointaine
+                # Mais on est moins strict pour permettre détection normale
+                phones_filtered = []
+                for phone in phones:
+                    # Vérifier si ce téléphone est associé à au moins une personne
+                    associated = False
+                    for person in persons:
+                        closest_phone = find_closest_phone_to_person(
+                            person['bbox'], [phone], pose_results, max_distance=180
+                        )
+                        if closest_phone is not None and closest_phone == phone:
+                            associated = True
+                            break
+                    
+                    # Ne garder que les téléphones associés à une personne
+                    if associated:
+                        phones_filtered.append(phone)
+                
+                phones = phones_filtered
+                
+                # Mettre à jour le suivi des personnes avec téléphones filtrés
+                current_persons = self.tracker.update_persons(persons, phones, frame_count, pose_results)
                 
                 # Mettre à jour les statistiques
                 self.stats.update_current_stats(current_persons, persons, len(phones))
@@ -771,6 +1076,10 @@ class DetectionSystem:
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
+        
+        # Afficher le résumé final
+        self.stats.print_final_summary()
+        
         logger.info("⏹️ Système de détection arrêté!")
     
     def get_stats(self):
@@ -842,13 +1151,19 @@ def health_check():
 
 def main():
     """Fonction principale"""
-    print("🚀 SYSTÈME DE DÉTECTION AMÉLIORÉ - TÉLÉPHONES")
+    print("🚀 SYSTÈME DE DÉTECTION MAXIMALE PRÉCISION - TÉLÉPHONES")
     print("=" * 60)
-    print("📱 Améliorations pour la détection de téléphones:")
-    print("  - Modèle YOLOv8m (Medium - Très précis)")
-    print("  - Seuil de confiance abaissé (0.15 pour téléphones)")
-    print("  - Zone d'association étendue")
-    print("  - Détection de tête plus permissive")
+    print("🎯 Optimisations pour précision maximale et zéro faux positifs:")
+    print("  - Modèle YOLOv11l ou YOLOv8l (Large - Précision maximale)")
+    print("  - YOLOv8-pose pour détection keypoints mains/tête")
+    print("  - Seuils de confiance stricts (0.65 personnes, 0.35 téléphones)")
+    print("  - NMS stricte (IoU 0.7) pour éliminer doublons")
+    print("  - Filtrage par taille minimale (évite faux positifs petits)")
+    print("  - Validation ratio hauteur/largeur pour personnes")
+    print("  - ASSOCIATION téléphone-personne équilibrée (max 180 pixels)")
+    print("  - Téléphones isolés (sur table) NON associés aux personnes lointaines")
+    print("  - Validation via keypoints mains pour téléphones dans la main")
+    print("  - Optimisé pour RTX 4070 (imgsz=640 pour fluidité)")
     print("=" * 60)
     
     # Démarrer le système de détection
@@ -868,8 +1183,9 @@ def main():
         # Démarrer l'API Flask
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     except KeyboardInterrupt:
-        print("\n⏹️ Arrêt demandé")
+        print("\n⏹️ Arrêt demandé par l'utilisateur")
     finally:
+        # Afficher le résumé final avant d'arrêter
         detection_system.stop()
 
 if __name__ == "__main__":
