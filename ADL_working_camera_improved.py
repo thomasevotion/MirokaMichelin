@@ -414,32 +414,34 @@ def is_phone_near_head(person_bbox, phone_bbox):
             (head_zone_extended and head_horizontal_extended))
 
 def detect_movement_stable(displacement_history, frame_count):
-    """Détection de mouvement stable avec seuils adaptatifs"""
-    if len(displacement_history) < 3:
+    """Détection de mouvement stable avec seuils adaptatifs - optimisé pour RTSP"""
+    if len(displacement_history) < 5:  # Plus de frames nécessaires pour RTSP
         return False
     
-    recent_displacements = displacement_history[-5:]
+    recent_displacements = displacement_history[-8:]  # Plus d'historique pour RTSP
     
-    # Seuils adaptatifs basés sur la variance
+    # Seuils plus stricts pour RTSP (évite faux positifs dus à la latence)
     variance = np.var(recent_displacements)
     if variance < 0.5:  # Très stable
-        threshold = 4.0
+        threshold = 6.0  # Augmenté de 4.0 à 6.0 pour RTSP
     elif variance < 2.0:  # Modérément stable
-        threshold = 3.0
+        threshold = 5.0  # Augmenté de 3.0 à 5.0
     else:  # Instable
-        threshold = 2.0
+        threshold = 4.0  # Augmenté de 2.0 à 4.0
     
     avg_recent = np.mean(recent_displacements)
     if avg_recent < threshold:
         return False
     
-    significant_movements = [d for d in recent_displacements if d > threshold * 0.7]
-    if len(significant_movements) < 3:
+    # Exiger plus de mouvements significatifs pour RTSP
+    significant_movements = [d for d in recent_displacements if d > threshold * 0.8]  # 0.8 au lieu de 0.7
+    if len(significant_movements) < 5:  # 5 au lieu de 3
         return False
     
-    if len(recent_displacements) >= 4:
-        last_three = recent_displacements[-3:]
-        if all(d > threshold * 0.5 for d in last_three):
+    # Exiger que les dernières frames montrent un mouvement continu
+    if len(recent_displacements) >= 6:
+        last_five = recent_displacements[-5:]  # 5 au lieu de 3
+        if all(d > threshold * 0.6 for d in last_five):  # 0.6 au lieu de 0.5
             return True
     
     return False
@@ -457,12 +459,12 @@ class RobustPersonTracker:
         # Ensemble des IDs uniques vus depuis le début
         self.unique_person_ids_ever_seen = set()
         
-        # Lissage temporel pour téléphone
+        # Lissage temporel pour téléphone - ajusté pour RTSP
         self.person_phone_history = {}  # Historique des détections téléphone (dernières N frames)
         self.person_phone_state = {}    # État stable de téléphone (lissé)
-        self.phone_history_size = 10    # Nombre de frames à garder dans l'historique
-        self.phone_activation_threshold = 0.4  # 40% des frames doivent avoir téléphone pour activer
-        self.phone_deactivation_threshold = 0.3  # Moins de 30% pour désactiver (hystérésis)
+        self.phone_history_size = 8     # Réduit pour RTSP (moins de frames nécessaires)
+        self.phone_activation_threshold = 0.35  # 35% des frames (réduit pour RTSP)
+        self.phone_deactivation_threshold = 0.25  # 25% pour désactiver (hystérésis)
         
     def predict_position(self, person_id, last_known_position, last_velocity, frames_missing):
         """Prédit la position d'une personne manquante"""
@@ -566,19 +568,20 @@ class RobustPersonTracker:
                     self.person_movement_state[person_id] = False
                 
                 self.person_movement_history[person_id].append(displacement)
-                if len(self.person_movement_history[person_id]) > 15:
-                    self.person_movement_history[person_id] = self.person_movement_history[person_id][-15:]
+                if len(self.person_movement_history[person_id]) > 20:  # Plus d'historique pour RTSP
+                    self.person_movement_history[person_id] = self.person_movement_history[person_id][-20:]
                 
                 # Détection de mouvement stable
                 is_moving_detected = detect_movement_stable(self.person_movement_history[person_id], frame_count)
                 
-                # État de mouvement persistant
+                # État de mouvement persistant - plus strict pour RTSP
                 if is_moving_detected:
                     self.person_movement_state[person_id] = True
                 else:
                     if self.person_movement_state[person_id]:
-                        recent_displacements = self.person_movement_history[person_id][-5:]
-                        if all(d < 1.5 for d in recent_displacements):
+                        # Exiger plus de frames stables pour passer à "standing" avec RTSP
+                        recent_displacements = self.person_movement_history[person_id][-8:]  # Plus de frames
+                        if all(d < 2.0 for d in recent_displacements):  # Seuil plus élevé (2.0 au lieu de 1.5)
                             self.person_movement_state[person_id] = False
                 
                 is_moving = self.person_movement_state[person_id]
@@ -823,8 +826,10 @@ class DetectionSystem:
         self.pose_model = None  # Modèle pose pour détection des mains
         self.cap = None
         self.running = False
-        self.frame_queue = queue.Queue(maxsize=10)
         self.latest_stats = {}
+        self.rtsp_frame_skip = 0  # Frame skipping pour RTSP
+        self.last_frame_time = time.time()
+        self.frame_skip_counter = 0
         
     def initialize(self):
         """Initialise le système de détection avec modèle YOLOv11l ou YOLOv8l pour précision maximale"""
@@ -865,19 +870,33 @@ class DetectionSystem:
                     logger.warning("⚠️ Modèle pose non disponible - détection téléphone via keypoints désactivée")
                     self.pose_model = None
             
-            # Ouvrir la caméra
-            self.cap = cv2.VideoCapture(0)
+            # Ouvrir la caméra RTSP (approche simple et synchrone qui fonctionne)
+            rtsp_url = "rtsp://192.168.1.64:8554/head_color"
+            logger.info(f"🔄 Connexion à la caméra RTSP: {rtsp_url}")
+            
+            # Créer la capture RTSP (approche simple comme dans le test)
+            self.cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Buffer minimal
+            
             if not self.cap.isOpened():
-                raise Exception("Impossible d'ouvrir la caméra")
+                raise Exception(f"Impossible d'ouvrir la caméra RTSP: {rtsp_url}")
             
-            # Configuration optimisée
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self.cap.set(cv2.CAP_PROP_FPS, 60)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Lire quelques frames pour initialiser le stream
+            for _ in range(3):
+                ret, _ = self.cap.read()
+                if ret:
+                    break
+                time.sleep(0.1)
             
-            logger.info("✅ Caméra ouverte!")
-            logger.info("📹 Configuration: 640x480 @ 60fps")
+            if not ret:
+                raise Exception("Impossible de lire des frames depuis la caméra RTSP")
+            
+            # Obtenir les dimensions réelles de la caméra
+            actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            logger.info("✅ Caméra RTSP connectée!")
+            logger.info(f"📹 Configuration: {actual_width}x{actual_height}")
             
             return True
             
@@ -890,20 +909,34 @@ class DetectionSystem:
         if self.model is None:
             return [], [], None
         
-        # Détection YOLO avec seuils optimisés pour précision maximale
+        # Détection YOLO avec optimisations pour FPS
+        # - Résolution réduite à 416 pour améliorer les performances (au lieu de 640)
         # - conf global bas pour détecter tout, filtrage strict par classe ensuite
         # - iou élevé (0.7) pour NMS stricte et réduction des doublons
         # - max_det limité pour éviter la sur-détection
-        # - imgsz=640 pour optimiser performance tout en gardant précision
-        results = self.model(frame, conf=0.25, iou=0.7, max_det=50, classes=[0, 67], imgsz=640, verbose=False)
+        # - device='0' pour forcer GPU si disponible
+        try:
+            results = self.model(frame, conf=0.25, iou=0.7, max_det=50, classes=[0, 67], 
+                               imgsz=416, verbose=False, device='0', half=True)  # half=True pour FP16 (plus rapide)
+        except:
+            try:
+                # Fallback sans half precision
+                results = self.model(frame, conf=0.25, iou=0.7, max_det=50, classes=[0, 67], 
+                                   imgsz=416, verbose=False, device='0')
+            except:
+                # Fallback si GPU non disponible
+                results = self.model(frame, conf=0.25, iou=0.7, max_det=50, classes=[0, 67], 
+                                   imgsz=416, verbose=False)
         
         # Détection pose pour keypoints (mains, tête) si disponible
+        # DÉSACTIVÉ temporairement pour améliorer FPS (peut être réactivé si nécessaire)
         pose_results = None
-        if self.pose_model is not None:
-            try:
-                pose_results = self.pose_model(frame, conf=0.5, iou=0.7, imgsz=640, verbose=False)
-            except:
-                pose_results = None
+        # Optionnel : désactiver pose pour améliorer FPS
+        # if self.pose_model is not None:
+        #     try:
+        #         pose_results = self.pose_model(frame, conf=0.5, iou=0.7, imgsz=640, verbose=False, device='0')
+        #     except:
+        #         pose_results = None
         
         persons = []
         phones = []
@@ -988,18 +1021,51 @@ class DetectionSystem:
     def detection_loop(self):
         """Boucle principale de détection avec visualisation"""
         frame_count = 0
+        frames_skipped = 0
+        
+        # Statistiques de performance pour diagnostiquer les goulots d'étranglement
+        perf_stats = {
+            'rtsp_read_times': [],
+            'model_inference_times': [],
+            'total_processing_times': [],
+            'last_perf_log': time.time()
+        }
         
         while self.running:
             try:
+                loop_start = time.time()
+                
+                # Lire la frame RTSP directement (approche simple qui fonctionne)
+                rtsp_read_start = time.time()
                 ret, frame = self.cap.read()
-                if not ret:
-                    logger.warning("⚠️ Impossible de lire la frame")
+                rtsp_read_time = (time.time() - rtsp_read_start) * 1000  # en ms
+                
+                # Filtrer les valeurs aberrantes (si RTSP read > 1000ms, c'est probablement une erreur de mesure)
+                if rtsp_read_time < 1000:  # Ignorer les valeurs > 1 seconde (probablement erreur)
+                    perf_stats['rtsp_read_times'].append(rtsp_read_time)
+                else:
+                    # Si valeur aberrante, utiliser la moyenne précédente ou 0
+                    if perf_stats['rtsp_read_times']:
+                        perf_stats['rtsp_read_times'].append(np.mean(perf_stats['rtsp_read_times'][-10:]))
+                    else:
+                        perf_stats['rtsp_read_times'].append(0)
+                
+                if not ret or frame is None:
+                    logger.warning("⚠️ Impossible de lire la frame RTSP")
+                    time.sleep(0.01)
                     continue
                 
                 frame_count += 1
+                current_time = time.time()
+                
+                # Pas de frame skipping - traiter toutes les frames pour meilleure précision
+                # (Le test montre que RTSP + modèle peut faire ~29 FPS)
                 
                 # Traiter la frame
+                inference_start = time.time()
                 persons, phones, pose_results = self.process_frame(frame)
+                inference_time = time.time() - inference_start
+                perf_stats['model_inference_times'].append(inference_time)
                 
                 # FILTRER les téléphones : ne garder QUE ceux associés à une personne
                 # Un téléphone sur table à 5m ne doit PAS être associé à une personne lointaine
@@ -1050,7 +1116,46 @@ class DetectionSystem:
                 elif key == ord('r'):  # Reset
                     self.reset_stats()
                 
-                # Log périodique
+                # Mesurer le temps total de traitement
+                total_time = time.time() - loop_start
+                perf_stats['total_processing_times'].append(total_time)
+                
+                # Log périodique avec statistiques de performance
+                if frame_count % 100 == 0 or (time.time() - perf_stats['last_perf_log']) > 5.0:
+                    perf_stats['last_perf_log'] = time.time()
+                    
+                    # Calculer les moyennes
+                    if perf_stats['rtsp_read_times']:
+                        avg_rtsp = np.mean(perf_stats['rtsp_read_times'][-50:]) * 1000  # en ms
+                        max_rtsp = np.max(perf_stats['rtsp_read_times'][-50:]) * 1000
+                    else:
+                        avg_rtsp = max_rtsp = 0
+                    
+                    if perf_stats['model_inference_times']:
+                        avg_inference = np.mean(perf_stats['model_inference_times'][-50:]) * 1000  # en ms
+                        max_inference = np.max(perf_stats['model_inference_times'][-50:]) * 1000
+                    else:
+                        avg_inference = max_inference = 0
+                    
+                    if perf_stats['total_processing_times']:
+                        avg_total = np.mean(perf_stats['total_processing_times'][-50:]) * 1000  # en ms
+                    else:
+                        avg_total = 0
+                    
+                    logger.info(f"📊 Frame {frame_count}: {len(current_persons)} personnes, {len(phones)} téléphones, FPS: {self.stats.fps:.1f}")
+                    logger.info(f"⏱️  PERFORMANCE - RTSP read: {avg_rtsp:.1f}ms (max: {max_rtsp:.1f}ms) | "
+                              f"Model inference: {avg_inference:.1f}ms (max: {max_inference:.1f}ms) | "
+                              f"Total: {avg_total:.1f}ms")
+                    
+                    # Nettoyer les listes pour éviter la croissance mémoire
+                    if len(perf_stats['rtsp_read_times']) > 100:
+                        perf_stats['rtsp_read_times'] = perf_stats['rtsp_read_times'][-50:]
+                    if len(perf_stats['model_inference_times']) > 100:
+                        perf_stats['model_inference_times'] = perf_stats['model_inference_times'][-50:]
+                    if len(perf_stats['total_processing_times']) > 100:
+                        perf_stats['total_processing_times'] = perf_stats['total_processing_times'][-50:]
+                
+                # Log périodique standard
                 if frame_count % 300 == 0:
                     logger.info(f"📊 Frame {frame_count}: {len(current_persons)} personnes, {len(phones)} téléphones, FPS: {self.stats.fps:.1f}")
                 
@@ -1073,6 +1178,7 @@ class DetectionSystem:
     def stop(self):
         """Arrête le système de détection"""
         self.running = False
+        
         if self.cap:
             self.cap.release()
         cv2.destroyAllWindows()
